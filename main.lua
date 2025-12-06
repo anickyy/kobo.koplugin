@@ -9,6 +9,7 @@ local T = require("ffi/util").template
 local KoboBluetooth = require("src/kobo_bluetooth")
 local MetadataParser = require("src/metadata_parser")
 local ReadingStateSync = require("src/reading_state_sync")
+local UIManager = require("ui/uimanager")
 local VirtualLibrary = require("src/virtual_library")
 
 local SYNC_DIRECTION = {
@@ -138,8 +139,24 @@ local metadata_parser = MetadataParser:new()
 local virtual_library = VirtualLibrary:new(metadata_parser)
 local reading_state_sync = ReadingStateSync:new(metadata_parser)
 
-if virtual_library:isActive() then
-    logger.info("KoboPlugin: Kobo plugin is active, applying patches")
+local default_settings = {
+    enable_virtual_library = true,
+    sync_reading_state = false,
+    enable_auto_sync = false,
+    enable_sync_from_kobo = false,
+    enable_sync_to_kobo = true,
+    sync_from_kobo_newer = SYNC_DIRECTION.PROMPT,
+    sync_from_kobo_older = SYNC_DIRECTION.NEVER,
+    sync_to_kobo_newer = SYNC_DIRECTION.SILENT,
+    sync_to_kobo_older = SYNC_DIRECTION.NEVER,
+    paired_devices = {},
+}
+
+local plugin_settings = G_reader_settings:readSetting("kobo_plugin") or default_settings
+local enable_virtual_library = plugin_settings.enable_virtual_library ~= false
+
+if virtual_library:isActive() and enable_virtual_library then
+    logger.info("KoboPlugin: virtual library is active, applying patches")
     applyShowReaderExtensions(virtual_library)
     applyFilesystemExtensions(virtual_library)
     applyDocumentExtensions(virtual_library)
@@ -156,17 +173,7 @@ local kobo_bluetooth = KoboBluetooth:new()
 local KoboPlugin = WidgetContainer:extend({
     name = "kobo_plugin",
     is_doc_only = false,
-    default_settings = {
-        sync_reading_state = false,
-        enable_auto_sync = false,
-        enable_sync_from_kobo = false,
-        enable_sync_to_kobo = true,
-        sync_from_kobo_newer = SYNC_DIRECTION.PROMPT,
-        sync_from_kobo_older = SYNC_DIRECTION.NEVER,
-        sync_to_kobo_newer = SYNC_DIRECTION.SILENT,
-        sync_to_kobo_older = SYNC_DIRECTION.NEVER,
-        paired_devices = {},
-    },
+    default_settings = default_settings,
 })
 
 ---
@@ -220,6 +227,28 @@ function KoboPlugin:addMenuItems()
 end
 
 ---
+-- Creates virtual library enable/disable menu item.
+-- @return table: Menu item configuration.
+function KoboPlugin:createVirtualLibraryToggleMenuItem()
+    return {
+        text = _("Enable virtual library"),
+        help_text = _(
+            "When enabled, access your Kobo library from within KOReader. When disabled, the virtual library will not be shown."
+        ),
+        checked_func = function()
+            return self.settings.enable_virtual_library
+        end,
+        callback = function()
+            self.settings.enable_virtual_library = not self.settings.enable_virtual_library
+            self:saveSettings()
+
+            UIManager:askForRestart()
+        end,
+        separator = true,
+    }
+end
+
+---
 -- Creates sync enable/disable menu item.
 -- @return table: Menu item configuration.
 function KoboPlugin:createSyncToggleMenuItem()
@@ -234,7 +263,6 @@ function KoboPlugin:createSyncToggleMenuItem()
             self:saveSettings()
 
             local InfoMessage = require("ui/widget/infomessage")
-            local UIManager = require("ui/uimanager")
             UIManager:show(InfoMessage:new({
                 text = enabled
                         and _("Reading state sync enabled\n\nKOReader and Kobo reading positions will be synced.")
@@ -428,7 +456,6 @@ function KoboPlugin:createRefreshLibraryMenuItem()
             self.virtual_library:refresh()
 
             local InfoMessage = require("ui/widget/infomessage")
-            local UIManager = require("ui/uimanager")
             UIManager:show(InfoMessage:new({
                 text = _("Kobo library refreshed"),
                 timeout = 2,
@@ -450,7 +477,6 @@ function KoboPlugin:createAboutMenuItem()
             local accessible_books = parser:getAccessibleBooks()
 
             local InfoMessage = require("ui/widget/infomessage")
-            local UIManager = require("ui/uimanager")
             UIManager:show(InfoMessage:new({
                 text = string.format(
                     "Kobo Library\n\n"
@@ -485,18 +511,25 @@ function KoboPlugin:addToMainMenu(menu_items)
         return
     end
 
+    local sub_item_table = {
+        self:createVirtualLibraryToggleMenuItem(),
+    }
+
+    if self.settings.enable_virtual_library then
+        table.insert(sub_item_table, self:createSyncToggleMenuItem())
+        table.insert(sub_item_table, self:createAutoSyncMenuItem())
+        table.insert(sub_item_table, self:createManualSyncMenuItem())
+        table.insert(sub_item_table, self:createSyncBehaviorMenuItem())
+        table.insert(sub_item_table, self:createRefreshLibraryMenuItem())
+    end
+
+    table.insert(sub_item_table, self:createAboutMenuItem())
+
     menu_items.kobo_plugin = {
         text = _("Kobo Library"),
         sorting_hint = "filemanager_settings",
         separator = true,
-        sub_item_table = {
-            self:createSyncToggleMenuItem(),
-            self:createAutoSyncMenuItem(),
-            self:createManualSyncMenuItem(),
-            self:createSyncBehaviorMenuItem(),
-            self:createRefreshLibraryMenuItem(),
-            self:createAboutMenuItem(),
-        },
+        sub_item_table = sub_item_table,
     }
 end
 
