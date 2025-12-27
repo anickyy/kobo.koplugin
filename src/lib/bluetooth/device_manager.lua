@@ -10,7 +10,9 @@ local _ = require("gettext")
 local logger = require("logger")
 
 local DeviceManager = {
-    paired_devices_cache = {},
+    devices_cache = {},
+    device_connect_callbacks = {},
+    device_disconnect_callbacks = {},
 }
 
 ---
@@ -21,7 +23,9 @@ function DeviceManager:new()
     setmetatable(instance, self)
     self.__index = self
 
-    instance.paired_devices_cache = {}
+    instance.devices_cache = {}
+    instance.device_connect_callbacks = {}
+    instance.device_disconnect_callbacks = {}
 
     return instance
 end
@@ -85,6 +89,18 @@ end
 function DeviceManager:connectDevice(device, on_success)
     logger.info("DeviceManager: Connecting to device:", device.name, "path:", device.path)
 
+    local local_on_success = function()
+        logger.dbg("DeviceManager: Updating device cache for", device.address, "to connected")
+
+        if self.devices_cache[device.address] then
+            self.devices_cache[device.address].connected = true
+        end
+
+        if on_success then
+            on_success(device)
+        end
+    end
+
     if DbusAdapter.connectDevice(device.path) then
         logger.info("DeviceManager: Successfully connected to", device.name)
 
@@ -93,8 +109,14 @@ function DeviceManager:connectDevice(device, on_success)
             timeout = 2,
         }))
 
-        if on_success then
-            on_success(device)
+        local_on_success()
+
+        for _, callback in ipairs(self.device_connect_callbacks) do
+            local ok, err = pcall(callback, device)
+
+            if not ok then
+                logger.warn("DeviceManager: Device connect callback error:", err)
+            end
         end
 
         return true
@@ -111,12 +133,36 @@ function DeviceManager:connectDevice(device, on_success)
 end
 
 ---
+-- Connects to a Bluetooth device in the background (non-blocking).
+-- Uses a subprocess to avoid freezing the UI during D-Bus connection.
+-- Does not show notifications or invoke callbacks - use auto-detection polling
+-- to detect when the connection succeeds and handle input device setup.
+-- @param device table Device information table with path and name
+-- @return boolean True if background connect was started, false otherwise
+function DeviceManager:connectDeviceInBackground(device)
+    logger.info("DeviceManager: Starting background connect to:", device.name, "path:", device.path)
+
+    return DbusAdapter.connectDeviceInBackground(device.path)
+end
+---
 -- Disconnects from a Bluetooth device.
 -- @param device table Device information table with path and name
 -- @param on_success function Optional callback to execute on successful disconnection
 -- @return boolean True if disconnection succeeded, false otherwise
 function DeviceManager:disconnectDevice(device, on_success)
     logger.info("DeviceManager: Disconnecting from device:", device.name, "path:", device.path)
+
+    local local_on_success = function()
+        logger.dbg("DeviceManager: Updating device cache for", device.address, "to disconnected")
+
+        if self.devices_cache[device.address] then
+            self.devices_cache[device.address].connected = false
+        end
+
+        if on_success then
+            on_success(device)
+        end
+    end
 
     if DbusAdapter.disconnectDevice(device.path) then
         logger.info("DeviceManager: Successfully disconnected from", device.name)
@@ -126,8 +172,14 @@ function DeviceManager:disconnectDevice(device, on_success)
             timeout = 2,
         }))
 
-        if on_success then
-            on_success(device)
+        local_on_success()
+
+        for _, callback in ipairs(self.device_disconnect_callbacks) do
+            local ok, err = pcall(callback, device)
+
+            if not ok then
+                logger.warn("DeviceManager: Device disconnect callback error:", err)
+            end
         end
 
         return true
@@ -255,11 +307,7 @@ function DeviceManager:untrustDevice(device, on_success)
     return false
 end
 
----
--- Loads paired devices from D-Bus and caches them in memory.
-function DeviceManager:loadPairedDevices()
-    logger.dbg("DeviceManager: Loading paired devices")
-
+function DeviceManager.fetchAllDiscoveredDevices()
     local output = DbusAdapter.getManagedObjects()
 
     if not output then
@@ -268,25 +316,132 @@ function DeviceManager:loadPairedDevices()
         return
     end
 
-    local all_devices = DeviceParser.parseDiscoveredDevices(output)
-
-    self.paired_devices_cache = {}
-
-    for _, device in ipairs(all_devices) do
-        if device.paired then
-            table.insert(self.paired_devices_cache, device)
-            logger.dbg("DeviceManager: Cached paired device:", device.name, device.address)
-        end
-    end
-
-    logger.info("DeviceManager: Loaded", #self.paired_devices_cache, "paired devices")
+    return DeviceParser.parseDiscoveredDevices(output)
 end
 
 ---
--- Gets the list of cached paired devices.
--- @return table Array of paired device information
-function DeviceManager:getPairedDevices()
-    return self.paired_devices_cache
+-- Loads all discovered devices from D-Bus and caches them in memory.
+-- Stores devices in a map with address as key for efficient lookups.
+function DeviceManager:loadDevices()
+    logger.dbg("DeviceManager: Loading devices")
+
+    local all_devices = self.fetchAllDiscoveredDevices()
+
+    logger.dbg("DeviceManager: fetched devices", all_devices)
+
+    self.devices_cache = {}
+
+    if all_devices then
+        for _, device in ipairs(all_devices) do
+            if device.address then
+                self.devices_cache[device.address] = device
+            end
+        end
+    end
+
+    local device_count = 0
+
+    for _ in pairs(self.devices_cache) do
+        device_count = device_count + 1
+    end
+
+    logger.info("DeviceManager: Loaded", device_count, "devices")
+end
+
+---
+-- Gets the list of cached devices.
+-- Returns an array for backward compatibility.
+-- @return table Array of device information
+function DeviceManager:getDevices()
+    local devices_array = {}
+
+    for _, device in pairs(self.devices_cache) do
+        table.insert(devices_array, device)
+    end
+
+    return devices_array
+end
+
+---
+-- Gets a device by its Bluetooth address.
+-- Uses O(1) map lookup for efficiency.
+-- @param address string Bluetooth device address (e.g., "E4:17:D8:EC:04:1E")
+-- @return table|nil Device information if found, nil otherwise
+function DeviceManager:getDeviceByAddress(address)
+    if not address then
+        return nil
+    end
+
+    return self.devices_cache[address]
+end
+
+---
+-- Updates a device's properties in the cache efficiently.
+-- This method should be called in response to D-Bus property change signals
+-- to keep the cache in sync without requiring full reloads.
+-- @param device_address string Bluetooth device address
+-- @param properties table Properties to update (e.g., {Connected = true, RSSI = -50})
+function DeviceManager:updateDeviceProperties(device_address, properties)
+    if not device_address then
+        logger.warn("DeviceManager: Cannot update properties - no device address provided")
+
+        return
+    end
+
+    if not self.devices_cache[device_address] then
+        logger.dbg("DeviceManager: Device not in cache, creating entry:", device_address)
+
+        self.devices_cache[device_address] = {
+            address = device_address,
+            connected = false,
+            paired = false,
+            trusted = false,
+            rssi = 0,
+            name = "",
+            path = "/org/bluez/hci0/dev_" .. device_address:gsub(":", "_"),
+        }
+    end
+
+    local updated_properties = {}
+
+    for key, value in pairs(properties) do
+        if key == "Connected" then
+            self.devices_cache[device_address].connected = value
+            table.insert(updated_properties, "connected=" .. tostring(value))
+        elseif key == "Paired" then
+            self.devices_cache[device_address].paired = value
+            table.insert(updated_properties, "paired=" .. tostring(value))
+        elseif key == "Trusted" then
+            self.devices_cache[device_address].trusted = value
+            table.insert(updated_properties, "trusted=" .. tostring(value))
+        elseif key == "RSSI" then
+            self.devices_cache[device_address].rssi = value
+            table.insert(updated_properties, "rssi=" .. tostring(value))
+        elseif key == "Name" then
+            self.devices_cache[device_address].name = value
+            table.insert(updated_properties, "name=" .. tostring(value))
+        end
+    end
+
+    if #updated_properties > 0 then
+        logger.dbg("DeviceManager: Updated properties for", device_address, ":", table.concat(updated_properties, ", "))
+    end
+end
+
+---
+-- Registers a callback to be invoked when a device connects.
+-- @param callback function Callback function that receives (device) parameter
+function DeviceManager:registerDeviceConnectCallback(callback)
+    table.insert(self.device_connect_callbacks, callback)
+    logger.dbg("DeviceManager: Registered device connect callback")
+end
+
+---
+-- Registers a callback to be invoked when a device disconnects.
+-- @param callback function Callback function that receives (device) parameter
+function DeviceManager:registerDeviceDisconnectCallback(callback)
+    table.insert(self.device_disconnect_callbacks, callback)
+    logger.dbg("DeviceManager: Registered device disconnect callback")
 end
 
 return DeviceManager

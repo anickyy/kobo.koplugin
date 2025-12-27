@@ -271,6 +271,7 @@ function InputDeviceHandler:waitForBluetoothInputDevice(timeout, poll_interval)
             end
         end
 
+        -- TODO(OGKevin): use UIManager:nextTick instead of sleep to avoid blocking main thread
         ffiUtil.sleep(poll_interval)
     end
 
@@ -289,7 +290,7 @@ function InputDeviceHandler:autoOpenConnectedDevices(paired_devices)
         if device.connected then
             logger.info("InputDeviceHandler: Found connected device on startup:", device.name or device.address)
 
-            local success = self:openIsolatedInputDevice(device, false, false)
+            local success = self:openIsolatedInputDevice(device, false, true)
 
             if success then
                 logger.info("InputDeviceHandler: Auto-opened input device for", device.name or device.address)
@@ -303,13 +304,13 @@ end
 -- This bypasses KOReader's main input system, providing events only from Bluetooth devices.
 --
 -- Device detection strategy (in order of preference):
---   1. Wait for new device: If wait_for_device=true, poll for new devices first
---   2. Name matching: Match D-Bus device name with sysfs device name
+--   1. Name matching: Match D-Bus device name with sysfs device name (if device_info.name provided)
+--   2. Wait for new device: If wait_for_device=true and no match found, poll for new devices
 --   3. Auto-detection: Single device auto-select, fallback to event4
 --
--- The wait-first approach ensures that when connecting a new device, we detect
--- the newly appeared device rather than trying to match against devices that
--- may not have appeared yet in the kernel.
+-- Name matching is tried first to avoid waiting if the device already exists.
+-- This is particularly useful when auto-opening devices on startup or when
+-- the device was already connected before the connection event.
 --
 -- Name matching provides direct correlation between D-Bus (MAC address) and
 -- kernel (/dev/input/eventN) by comparing device names:
@@ -327,20 +328,33 @@ function InputDeviceHandler:openIsolatedInputDevice(device_info, show_messages, 
 
     local detected_path
 
-    if wait_for_device then
-        logger.dbg("InputDeviceHandler: Waiting for input device to appear...")
-        detected_path = self:waitForBluetoothInputDevice()
-
-        if detected_path then
-            logger.info("InputDeviceHandler: Device appeared while waiting:", detected_path)
-        end
-    end
-
-    if not detected_path and device_info.name then
+    if device_info.name then
         detected_path = self:findDeviceByName(device_info.name)
 
         if detected_path then
             logger.info("InputDeviceHandler: Matched device by name:", detected_path)
+        end
+    end
+
+    if not detected_path and wait_for_device then
+        local info_msg = InfoMessage:new({
+            text = _("Waiting 5 seconds for Bluetooth input device to appear..."),
+            timeout = 0,
+        })
+
+        if show_messages then
+            UIManager:show(info_msg)
+        end
+
+        logger.dbg("InputDeviceHandler: Waiting for input device to appear...")
+        detected_path = self:waitForBluetoothInputDevice()
+
+        if show_messages then
+            UIManager:close(info_msg)
+        end
+
+        if detected_path then
+            logger.info("InputDeviceHandler: Device appeared while waiting:", detected_path)
         end
     end
 
@@ -427,6 +441,38 @@ function InputDeviceHandler:closeIsolatedInputDevice(device_info)
 end
 
 ---
+-- Closes all isolated Bluetooth input devices.
+-- Iterates through all open isolated readers and closes them.
+-- Safe to call even if no devices are open.
+function InputDeviceHandler:closeAllIsolatedInputDevices()
+    logger.dbg("InputDeviceHandler: Closing all isolated input devices")
+
+    local count = 0
+
+    for device_address, reader_info in pairs(self.isolated_readers) do
+        local device_path = reader_info.device_path
+
+        logger.info("InputDeviceHandler: Closing isolated reader for", device_address)
+
+        reader_info.reader:close()
+
+        for _, callback in ipairs(self.device_close_callbacks) do
+            local ok, err = pcall(callback, device_address, device_path)
+
+            if not ok then
+                logger.warn("InputDeviceHandler: Device close callback error:", err)
+            end
+        end
+
+        count = count + 1
+    end
+
+    self.isolated_readers = {}
+
+    logger.dbg("InputDeviceHandler: Closed", count, "isolated input devices")
+end
+
+---
 -- Registers a callback for key events from isolated readers.
 -- This callback will receive events ONLY from Bluetooth devices.
 --
@@ -484,11 +530,13 @@ end
 ---
 -- Polls all isolated readers for input events.
 -- Should be called periodically (e.g., via UIManager scheduling).
+-- Automatically cleans up readers that have been closed due to device disconnect.
 --
 -- @param timeout_ms number Optional timeout in milliseconds (default: 0 for non-blocking)
 -- @return table|nil Array of all events from all Bluetooth devices, or nil if none
 function InputDeviceHandler:pollIsolatedReaders(timeout_ms)
     local all_events = {}
+    local disconnected_addresses = {}
 
     for address, reader_info in pairs(self.isolated_readers) do
         local events = reader_info.reader:poll(timeout_ms)
@@ -503,6 +551,26 @@ function InputDeviceHandler:pollIsolatedReaders(timeout_ms)
 
                 new_ev.device_address = address
                 table.insert(all_events, new_ev)
+            end
+        end
+
+        if not reader_info.reader:isOpen() then
+            table.insert(disconnected_addresses, {
+                address = address,
+                device_path = reader_info.device_path,
+            })
+        end
+    end
+
+    for _, disconnected in ipairs(disconnected_addresses) do
+        logger.info("InputDeviceHandler: Cleaning up disconnected reader for", disconnected.address)
+        self.isolated_readers[disconnected.address] = nil
+
+        for _, callback in ipairs(self.device_close_callbacks) do
+            local ok, err = pcall(callback, disconnected.address, disconnected.device_path)
+
+            if not ok then
+                logger.warn("InputDeviceHandler: Device close callback error:", err)
             end
         end
     end

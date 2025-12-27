@@ -21,15 +21,30 @@ _G.setMockPopenFailure = nil
 _G.resetAllMocks = nil
 _G.getExecutedCommands = nil
 _G.clearExecutedCommands = nil
+_G.setMockRunInSubProcessResult = nil
+_G.getMockRunInSubProcessCallback = nil
 
 -- Global mocks for shell execution (used by multiple modules)
 local _mock_os_execute_result = 0
 local _mock_io_popen_output = ""
 local _executed_commands = {}
 
+-- Use _G for subprocess mocks to ensure preload functions can access them
+_G._mock_run_in_subprocess_result = _G._mock_run_in_subprocess_result or 12345
+_G._mock_run_in_subprocess_callback = _G._mock_run_in_subprocess_callback
 -- Mock os.execute for shell commands
 os.execute = function(cmd)
     table.insert(_executed_commands, cmd)
+
+    -- Auto-flip Bluetooth state when turnOn/turnOff commands succeed
+    if _mock_os_execute_result == 0 then
+        if cmd:match("Powered%s+variant:boolean:true") then
+            _mock_io_popen_output = "variant boolean true"
+        elseif cmd:match("Powered%s+variant:boolean:false") then
+            _mock_io_popen_output = "variant boolean false"
+        end
+    end
+
     return _mock_os_execute_result
 end
 
@@ -70,6 +85,8 @@ function resetAllMocks()
     _mock_os_execute_result = 0
     _mock_io_popen_output = "variant boolean true"
     _executed_commands = {}
+    _G._mock_run_in_subprocess_result = 12345
+    _G._mock_run_in_subprocess_callback = nil
 end
 
 _G.resetAllMocks = resetAllMocks
@@ -312,7 +329,18 @@ if not package.preload["ffi/archiver"] then
     end
 end
 
--- Mock ffi/util module (used for T() template function)
+-- Mock ffi/util module (used for T() template function and subprocess)
+local function setMockRunInSubProcessResult(result)
+    _G._mock_run_in_subprocess_result = result
+end
+
+_G.setMockRunInSubProcessResult = setMockRunInSubProcessResult
+
+local function getMockRunInSubProcessCallback()
+    return _G._mock_run_in_subprocess_callback
+end
+
+_G.getMockRunInSubProcessCallback = getMockRunInSubProcessCallback
 if not package.preload["ffi/util"] then
     package.preload["ffi/util"] = function()
         return {
@@ -335,9 +363,10 @@ if not package.preload["ffi/util"] then
             sleep = function(seconds)
                 -- Mock sleep function for tests - does nothing
             end,
-            runInSubProcess = function(func, flag1, flag2)
-                -- Mock runInSubProcess function for tests - executes function directly
-                func()
+            runInSubProcess = function(func, with_pipe, double_fork)
+                _G._mock_run_in_subprocess_callback = func
+
+                return _G._mock_run_in_subprocess_result
             end,
         }
     end
@@ -356,6 +385,99 @@ if not package.preload["ffi/linux_input_h"] then
     package.preload["ffi/linux_input_h"] = function()
         -- Stub - actual FFI declarations are not needed in tests
         return {}
+    end
+end
+
+-- Mock src/lib/bluetooth/dbus_monitor module (uses FFI)
+if not package.preload["src/lib/bluetooth/dbus_monitor"] then
+    package.preload["src/lib/bluetooth/dbus_monitor"] = function()
+        local MockDbusMonitor = {
+            is_active = false,
+            property_callbacks = {}, -- key -> {callback = function, priority = number}
+            sorted_callbacks = {}, -- array of {key, callback, priority} sorted by priority
+        }
+
+        function MockDbusMonitor:new()
+            local instance = {
+                is_active = false,
+                property_callbacks = {}, -- key -> {callback = function, priority = number}
+                sorted_callbacks = {}, -- array of {key, callback, priority} sorted by priority
+            }
+            setmetatable(instance, self)
+            self.__index = self
+
+            return instance
+        end
+
+        function MockDbusMonitor:startMonitoring()
+            self.is_active = true
+
+            return true
+        end
+
+        function MockDbusMonitor:stopMonitoring()
+            self.is_active = false
+        end
+
+        function MockDbusMonitor:isActive()
+            return self.is_active
+        end
+
+        function MockDbusMonitor:registerCallback(key, callback, priority)
+            priority = priority or 100
+
+            self.property_callbacks[key] = {
+                callback = callback,
+                priority = priority,
+            }
+
+            self:_rebuildSortedCallbacks()
+        end
+
+        function MockDbusMonitor:unregisterCallback(key)
+            self.property_callbacks[key] = nil
+
+            self:_rebuildSortedCallbacks()
+        end
+
+        function MockDbusMonitor:_rebuildSortedCallbacks()
+            self.sorted_callbacks = {}
+
+            for key, callback_info in pairs(self.property_callbacks) do
+                table.insert(self.sorted_callbacks, {
+                    key = key,
+                    callback = callback_info.callback,
+                    priority = callback_info.priority,
+                })
+            end
+
+            table.sort(self.sorted_callbacks, function(a, b)
+                return a.priority < b.priority
+            end)
+        end
+
+        function MockDbusMonitor:getCallbackCount()
+            local count = 0
+
+            for _ in pairs(self.property_callbacks) do
+                count = count + 1
+            end
+
+            return count
+        end
+
+        function MockDbusMonitor:hasCallback(key)
+            return self.property_callbacks[key] ~= nil
+        end
+
+        function MockDbusMonitor:simulatePropertyChange(device_address, properties)
+            -- Call callbacks in pre-sorted priority order
+            for _, callback_info in ipairs(self.sorted_callbacks) do
+                callback_info.callback(device_address, properties)
+            end
+        end
+
+        return MockDbusMonitor
     end
 end
 
@@ -1009,6 +1131,7 @@ if not package.preload["ui/uimanager"] then
             _allow_standby_calls = 0,
             _scheduled_tasks = {},
             _event_hook_calls = {},
+            _unschedule_calls = {},
             -- Configurable behavior
             _show_return_value = true,
         }
@@ -1079,6 +1202,7 @@ if not package.preload["ui/uimanager"] then
         end
 
         function UIManager:unschedule(task_id)
+            table.insert(self._unschedule_calls, { task_id = task_id })
             if self._scheduled_tasks then
                 self._scheduled_tasks[task_id] = nil
             end
@@ -1095,6 +1219,7 @@ if not package.preload["ui/uimanager"] then
             self._allow_standby_calls = 0
             self._scheduled_tasks = {}
             self._event_hook_calls = {}
+            self._unschedule_calls = {}
             self._show_return_value = true
         end
 
