@@ -53,8 +53,8 @@ function BookInfoManagerExt:init(virtual_library)
     self.virtual_library = virtual_library
     self.original_methods = {}
     self.db_location = DataStorage:getSettingsDir() .. "/bookinfo_cache.sqlite3"
-    local ok_pt, ProjectTitle = pcall(require, "projecttitle") 
-    if ok_pt and ProjectTitle then 
+    local ProjectTitle = package.loaded["projecttitle"] 
+    if ProjectTitle then 
         logger.info("KoboPlugin: Project: Title plugin is active") 
         self.pt_db_location = DataStorage:getSettingsDir() .. "/PT_bookinfo_cache.sqlite3"
     end
