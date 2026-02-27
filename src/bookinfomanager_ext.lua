@@ -53,6 +53,11 @@ function BookInfoManagerExt:init(virtual_library)
     self.virtual_library = virtual_library
     self.original_methods = {}
     self.db_location = DataStorage:getSettingsDir() .. "/bookinfo_cache.sqlite3"
+    local ok_pt, ProjectTitle = pcall(require, "projecttitle") 
+    if ok_pt and ProjectTitle then 
+        logger.info("KoboPlugin: Project: Title plugin is active") 
+        self.pt_db_location = DataStorage:getSettingsDir() .. "/PT_bookinfo_cache.sqlite3"
+    end
 end
 
 ---
@@ -170,6 +175,12 @@ function BookInfoManagerExt:writeBookInfoToDatabase(filepath, bookinfo)
 
     if not success then
         logger.warn("KoboPlugin: Failed to write bookinfo to database for:", filepath)
+    end
+
+    local success_pt = BookInfoDatabase:writeBookInfo(self.pt_db_location, filepath, bookinfo)
+    
+    if not success_pt then
+        logger.warn("KoboPlugin: Failed to write bookinfo to Project: Title database for:", filepath)
     end
 end
 
